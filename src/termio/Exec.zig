@@ -1511,6 +1511,23 @@ test "resolveGhosttyBin disables CLI integration without embedded helper" {
     ) == null);
 }
 
+test "resolveGhosttyBin does not alias the environment it read from" {
+    const alloc = std.testing.allocator;
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("GHOSTTY_BIN", "/Applications/cmux.app/Contents/Resources/bin/ghostty");
+
+    const bin = resolveGhosttyBin(
+        &env,
+        "/Applications/cmux.app/Contents/MacOS/cmux",
+    ).?;
+
+    // Must not alias the map: the caller writes GHOSTTY_BIN back, and
+    // `EnvMap.put` frees the old value buffer out from under this slice.
+    try std.testing.expect(bin.ptr != env.get("GHOSTTY_BIN").?.ptr);
+}
+
 /// The read thread works with a companion gather thread to form a two-stage
 /// pipeline that moves pty output into the terminal:
 ///
