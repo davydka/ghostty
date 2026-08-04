@@ -683,7 +683,8 @@ const Subprocess = struct {
                 log.warn("failed to get ghostty exe path err={}", .{err});
                 break :ghostty_path;
             }];
-            const ghostty_bin = resolveGhosttyBin(&env, exe_bin_path) orelse {
+            const resolved_bin = try resolveGhosttyBin(alloc, &env, exe_bin_path);
+            const ghostty_bin = resolved_bin orelse {
                 log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
                 break :ghostty_path;
             };
@@ -1464,68 +1465,123 @@ const Subprocess = struct {
 
 /// Resolve the CLI executable used by shell integration. Native Ghostty owns
 /// its executable path; embedded hosts can supply a distinct helper path.
-fn resolveGhosttyBin(env: *const EnvMap, self_exe_path: []const u8) ?[]const u8 {
+///
+/// The returned path is an `alloc`-owned copy. The copy is mandatory, not a
+/// convenience: in the embedded-helper case the path is read out of `env`, and
+/// the caller writes back to that same map. `EnvMap.put` frees the previous
+/// value buffer, so handing back the map's own slice would leave the caller --
+/// and any `dirname` slice derived from it -- pointing at freed heap.
+fn resolveGhosttyBin(
+    alloc: Allocator,
+    env: *const EnvMap,
+    self_exe_path: []const u8,
+) Allocator.Error!?[]const u8 {
     if (std.mem.eql(u8, std.fs.path.basename(self_exe_path), "ghostty")) {
-        return self_exe_path;
+        return try alloc.dupe(u8, self_exe_path);
     }
 
     const embedded_bin = env.get("GHOSTTY_BIN") orelse return null;
-    return if (embedded_bin.len > 0) embedded_bin else null;
+    if (embedded_bin.len == 0) return null;
+    return try alloc.dupe(u8, embedded_bin);
 }
 
 test "resolveGhosttyBin uses native Ghostty executable" {
-    var env = EnvMap.init(std.testing.allocator);
+    const alloc = std.testing.allocator;
+
+    var env = EnvMap.init(alloc);
     defer env.deinit();
     try env.put("GHOSTTY_BIN", "/embedded/helper");
 
+    const bin = (try resolveGhosttyBin(
+        alloc,
+        &env,
+        "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+    )).?;
+    defer alloc.free(bin);
+
     try std.testing.expectEqualStrings(
         "/Applications/Ghostty.app/Contents/MacOS/ghostty",
-        resolveGhosttyBin(
-            &env,
-            "/Applications/Ghostty.app/Contents/MacOS/ghostty",
-        ).?,
+        bin,
     );
 }
 
 test "resolveGhosttyBin uses embedded host helper" {
-    var env = EnvMap.init(std.testing.allocator);
-    defer env.deinit();
-    try env.put("GHOSTTY_BIN", "/Applications/cmux.app/Contents/Resources/bin/ghostty");
-
-    try std.testing.expectEqualStrings(
-        "/Applications/cmux.app/Contents/Resources/bin/ghostty",
-        resolveGhosttyBin(
-            &env,
-            "/Applications/cmux.app/Contents/MacOS/cmux",
-        ).?,
-    );
-}
-
-test "resolveGhosttyBin disables CLI integration without embedded helper" {
-    var env = EnvMap.init(std.testing.allocator);
-    defer env.deinit();
-
-    try std.testing.expect(resolveGhosttyBin(
-        &env,
-        "/Applications/host.app/Contents/MacOS/host",
-    ) == null);
-}
-
-test "resolveGhosttyBin does not alias the environment it read from" {
     const alloc = std.testing.allocator;
 
     var env = EnvMap.init(alloc);
     defer env.deinit();
     try env.put("GHOSTTY_BIN", "/Applications/cmux.app/Contents/Resources/bin/ghostty");
 
-    const bin = resolveGhosttyBin(
+    const bin = (try resolveGhosttyBin(
+        alloc,
         &env,
         "/Applications/cmux.app/Contents/MacOS/cmux",
-    ).?;
+    )).?;
+    defer alloc.free(bin);
 
-    // Must not alias the map: the caller writes GHOSTTY_BIN back, and
-    // `EnvMap.put` frees the old value buffer out from under this slice.
+    try std.testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin/ghostty",
+        bin,
+    );
+}
+
+test "resolveGhosttyBin disables CLI integration without embedded helper" {
+    const alloc = std.testing.allocator;
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+
+    try std.testing.expect(try resolveGhosttyBin(
+        alloc,
+        &env,
+        "/Applications/host.app/Contents/MacOS/host",
+    ) == null);
+}
+
+test "resolveGhosttyBin does not alias the environment it read from" {
+    // Regression test. This used to hand back the env map's own value slice for
+    // GHOSTTY_BIN, which the caller then fed straight back into that map:
+    //
+    //     env.put("GHOSTTY_BIN", ghostty_bin);
+    //     env.put("GHOSTTY_BIN_DIR", std.fs.path.dirname(ghostty_bin).?);
+    //
+    // `EnvMap.put` copies the new value and then frees the old buffer, so the
+    // first call left both slices dangling. The freed heap was read back into
+    // GHOSTTY_BIN_DIR and appended to PATH, so PATH picked up whatever bytes the
+    // allocator had reused that memory for -- breaking every tool that assumes
+    // PATH is valid UTF-8.
+    //
+    // Only the embedded-helper branch reads from the map, so only it could
+    // alias; the native branch is covered by the same assertion for free.
+    const alloc = std.testing.allocator;
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("GHOSTTY_BIN", "/Applications/cmux.app/Contents/Resources/bin/ghostty");
+
+    const bin = (try resolveGhosttyBin(
+        alloc,
+        &env,
+        "/Applications/cmux.app/Contents/MacOS/cmux",
+    )).?;
+    defer alloc.free(bin);
+
     try std.testing.expect(bin.ptr != env.get("GHOSTTY_BIN").?.ptr);
+
+    // Because it is an independent copy, it and its dirname survive the map
+    // freeing and replacing the value they were read from.
+    const bin_dir = std.fs.path.dirname(bin).?;
+    try env.put("GHOSTTY_BIN", bin);
+    try env.put("GHOSTTY_BIN_DIR", bin_dir);
+
+    try std.testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin/ghostty",
+        env.get("GHOSTTY_BIN").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin",
+        env.get("GHOSTTY_BIN_DIR").?,
+    );
 }
 
 /// The read thread works with a companion gather thread to form a two-stage
