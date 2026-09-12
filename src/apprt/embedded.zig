@@ -973,16 +973,29 @@ pub const Surface = struct {
         if (opts.working_directory) |c_wd| {
             const wd = std.mem.sliceTo(c_wd, 0);
             if (wd.len > 0) wd: {
-                var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
-                    log.warn(
-                        "error opening requested working directory dir={s} err={}",
-                        .{ wd, err },
-                    );
-                    break :wd;
-                };
-                defer dir.close(global.io());
-
-                const stat = dir.stat(global.io()) catch |err| {
+                // Stat the path; do not open it.
+                //
+                // This runs on the embedder's main thread -- surface_new is a
+                // synchronous C entry point -- and `global.io()` is a
+                // `std.Io.Threaded` whose `dirOpenDirPosix` issues the
+                // `openat` on the *calling* thread rather than handing it to
+                // the pool. On macOS, `openat` of a TCC-protected directory
+                // (~/Downloads, ~/Documents, ~/Desktop) blocks in the kernel
+                // until the user answers a consent dialog, with no timeout and
+                // no cancellation. On an unattended Mac nobody answers, so the
+                // embedding app's main thread is gone for good and neither
+                // `catch` below can ever run -- the failure is silent.
+                //
+                // Measured on macOS 26, ad-hoc-signed app with no grant:
+                // `open` of ~/Downloads never returned (sampled in `__open`),
+                // while `fstatat` of the same path returned rc=0 in under a
+                // millisecond. A path stat is not gated by these services.
+                //
+                // The opened handle was only ever used for the single stat
+                // below, so nothing else needs it. `statFile` follows symlinks
+                // and ignores the `Dir` when `sub_path` is absolute, which
+                // matches what `openDirAbsolute` did here.
+                const stat = std.Io.Dir.cwd().statFile(global.io(), wd, .{}) catch |err| {
                     log.warn(
                         "failed to stat requested working directory dir={s} err={}",
                         .{ wd, err },
